@@ -1,0 +1,343 @@
+---
+title: "The Coors Effect"
+subtitle: "Analyzing what Coors Field does to pitch movement, and which pitchers the Rockies should be targeting"
+author: "Charlie Wiebe"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center", dpi = 150)
+suppressPackageStartupMessages({ library(data.table); library(ggplot2); library(knitr) })
+set.seed(42)
+
+OUT <- "coors_out"
+rd  <- function(f) fread(file.path(OUT, f), encoding = "UTF-8")
+parks   <- rd("parks.csv")
+cells   <- rd("cells_paired.csv")
+grades  <- rd("pitch_grades.csv")
+pitch   <- rd("pitchers.csv")
+targets <- rd("targets_2026.csv")
+
+PT_NAME <- c(FF = "Four-seam", SI = "Sinker", FC = "Cutter", SL = "Slider", ST = "Sweeper", SV = "Slurve",
+             CU = "Curveball", CH = "Changeup", FS = "Splitter")
+PT_COL  <- c(FF = "#d1495b", SI = "#edae49", FC = "#8d6a9f", SL = "#00798c", ST = "#30638e", SV = "#7a9e7e",
+             CU = "#003d5b", CH = "#66a182", FS = "#e07a5f")
+ROX <- "#33006F"
+theme_set(theme_minimal(base_size = 12) +
+            theme(panel.grid.minor = element_blank(), plot.title = element_text(face = "bold"),
+                  plot.title.position = "plot", legend.position = "bottom"))
+
+wm     <- function(x, w) { ok <- is.finite(x) & is.finite(w) & w > 0; sum(x[ok] * w[ok]) / sum(w[ok]) }
+slope0 <- function(yc, xe, w) { ok <- is.finite(yc) & is.finite(xe) & is.finite(w); sum(w[ok] * xe[ok] * yc[ok]) / sum(w[ok] * xe[ok]^2) }
+f1 <- function(x, k = 1) formatC(x, format = "f", digits = k)
+n_pitch <- 2837254; n_coors <- 95063
+```
+
+<style>
+.key { background: #f4f2f8; border-left: 4px solid #33006F; padding: 12px 18px; margin: 16px 0; }
+</style>
+
+# Summary
+
+Coors Field sits at 5,190 feet, and every aerodynamic force on a pitch (Magnus lift, seam-wake force and drag) is drastically affected by this context. It's long been a given that pitches move less in Denver, but this independent analysis dives into *which* movement disappears, whether any way of building a pitch holds up better, and which pitchers keep their value when half their innings are thrown at Coors.
+
+Using `r format(n_pitch, big.mark = ",")` public Statcast pitches from 2023–2026 (`r format(n_coors, big.mark = ",")` at Coors), I compared the same pitcher, throwing the same pitch, in the same season, at Coors and elsewhere, then graded a Coors version of every pitch with a pitch-quality model I built separately ([Pitch Shaper](https://github.com/charliewiebe/pitch-shaper)).
+
+<div class="key">
+**Key findings**
+
+1. **Spin-driven movement keeps about 80% of itself at Coors, as air density predicts. Seam-driven movement keeps much less** (71% pooled; 55–69% for splitters, changeups and sinkers). Lift falls further than drag at Coors than at any other park.
+2. **High-ride four-seamers are the biggest losers** (5.7 grade points per arsenal, more than double any other fastball type). Cutters and gyro sliders gain.
+3. **The context contributes to real, quantifiable performance outcomes:** at Coors, four-seamers get 4.8 percentage points more ground balls and curveballs 8.1 points more whiffs, consistent with hitters subconciously expecting sea-level movement.
+4. **Profiles that the Rockies should be looking for:** velocity and extension, a fastball with either a steep VAA or whose flatness comes from a low release rather than ride, and a cutter or gyro slider as the main secondary pitch.
+</div>
+
+# Data and design
+
+**Source.** Pitch-level Statcast from Baseball Savant, regular season 2023–2026: release speed, spin rate, measured spin axis, release point and extension, and the 9-parameter trajectory fit (initial velocity and constant acceleration from 50 ft) that Statcast estimates for every pitch.
+
+**Design.** Park comparisons are confounded by who pitches where: the Rockies throw half their pitches at Coors. So every comparison is within a *cell*: one pitcher, one pitch type, and one season, at Coors vs. everywhere else. Cells need 10+ pitches at Coors and 50+ elsewhere, which leaves `r format(nrow(cells), big.mark = ",")` cells from `r uniqueN(cells$pitcher)` pitchers. Cells are weighted by their effective sample size, and uncertainty comes from a bootstrap that resamples pitchers.
+
+**Pitch labels.** Savant's pitch classifier uses movement, which Coors changes. Every pitch was re-labelled by the features air doesn't affect (velocity, spin rate, measured spin axis) to the pitcher's nearest pitch type. The re-label rate was the same at Coors and elsewhere (4.0% vs 3.9%), so Savant's labels don't drift at altitude (they likely already include this step in their pitch classifier for Rockies pitchers).
+
+# 1. Measuring the air from the pitches
+
+Statcast's trajectory fit gives each pitch a constant acceleration. Removing gravity leaves the aerodynamic acceleration, which splits into **drag** (along the velocity) and **lift** (across it: Magnus plus seam effects). Both are proportional to air density multiplied by velocity squared, so dividing by v² gives a per-pitch reading of the air.
+
+```{r physics-code, eval = FALSE, class.source = "fold-show"}
+GRAV <- 32.174; YP <- 17 / 12                     # ft/s^2; front of home plate (ft)
+
+# Time to travel dy feet along y under constant acceleration (Statcast's 9-parameter model)
+t_to <- function(vy, ay, dy) (-vy - sqrt(pmax(vy^2 - 2 * ay * dy, 0))) / ay
+
+# Split aerodynamic acceleration into drag (along v) and lift (across v) at mid-flight velocity
+aero <- function(vx0, vy0, vz0, ax, ay, az, tp) {
+  bx <- vx0 + ax * tp / 2; by <- vy0 + ay * tp / 2; bz <- vz0 + az * tp / 2
+  vb <- sqrt(bx^2 + by^2 + bz^2)
+  aD <- -(ax * bx + ay * by + (az + GRAV) * bz) / vb                   # drag magnitude
+  list(vb = vb, ux = bx / vb, uy = by / vb, uz = bz / vb, aD = aD,
+       tx = ax + aD * bx / vb, ty = ay + aD * by / vb, tz = az + GRAV + aD * bz / vb)   # lift vector
+}
+
+phys <- function(vx0, vy0, vz0, ax, ay, az, ext) {
+  tp <- t_to(vy0, ay, 50 - YP)
+  a  <- aero(vx0, vy0, vz0, ax, ay, az, tp)
+  list(kD = a$aD / a$vb^2,                                             # ∝ air density x drag coefficient
+       kT = sqrt(a$tx^2 + a$ty^2 + a$tz^2) / a$vb^2)                   # ∝ air density x lift coefficient
+}
+```
+
+Every pitch's drag and lift are expressed relative to the same pitcher's same pitch away from Coors, then summarised by park.
+
+```{r parks, fig.width = 8, fig.height = 5.5, fig.cap = "Each park's drag and lift relative to the same pitchers' pitches elsewhere. Thin air alone moves both together, along the dashed line."}
+pk <- copy(parks)[, coors := park == "COL"]
+ggplot(pk, aes(density_from_drag, lift)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey60") +
+  geom_point(aes(colour = coors, size = coors)) +
+  geom_text(data = pk[coors == TRUE], aes(label = "Coors Field"), hjust = -0.15, colour = ROX, fontface = "bold") +
+  geom_text(data = pk[coors == FALSE & (lift_vs_drag > 1.02 | lift_vs_drag < 0.985)], aes(label = park),
+            size = 3, colour = "grey40", vjust = -0.9) +
+  scale_colour_manual(values = c(`FALSE` = "grey55", `TRUE` = ROX), guide = "none") +
+  scale_size_manual(values = c(`FALSE` = 2, `TRUE` = 4), guide = "none") +
+  labs(x = "Drag (1 = pitcher's own average elsewhere)", y = "Lift", title = "Coors is the only park where lift falls well below drag")
+```
+
+```{r lift-drag}
+oth <- pk[coors == FALSE]
+co  <- pk[coors == TRUE]
+```
+
+At Coors, drag reads `r f1(co$density_from_drag, 3)` and lift `r f1(co$lift, 3)`. Lift-to-drag is `r f1(co$lift_vs_drag, 3)` there and `r f1(min(oth$lift_vs_drag), 3)`–`r f1(max(oth$lift_vs_drag), 3)` at the other 29 parks. Two mechanisms can do that: the drag coefficient rising in thinner air (lower Reynolds number), or lift lost beyond density. Spin isn't the cause: spin rate is actually 0.7% *higher* at Coors. The next section shows where the extra lift goes. One additionaly note: the air is thinnest in June–August (lift 0.78) and least thin in April, May and September (0.80).
+
+# 2. Which movement disappears
+
+## Magnus vs seam wake
+
+Hawk-Eye measures each pitch's spin axis directly. Magnus force pushes the ball perpendicular to that axis, so projecting the measured movement onto the spin-implied direction separates **Magnus movement** from movement **across** it (mostly seam-shifted wake).
+
+```{r split-code, eval = FALSE, class.source = "fold-show"}
+# Arm-side-normalised movement (in): hb_arm (+ = arm side), ivb. axis_m: measured spin axis, LHP mirrored
+sc[, th := (axis_m - 180) * pi / 180]                         # direction Magnus pushes the ball, from 12:00
+sc[, `:=`(m_mag  = hb_arm * sin(th) + ivb * cos(th),           # along the spin-implied direction
+          m_seam = hb_arm * cos(th) - ivb * sin(th))]          # across it: seam wake and other non-Magnus forces
+
+# Retention: weighted slope through the origin of the Coors value on the elsewhere value, across cells
+slope0 <- function(yc, xe, w) sum(w * xe * yc) / sum(w * xe^2)
+```
+
+```{r retention}
+ret <- function(d) d[, .(Magnus = slope0(m_mag_c, m_mag_e, w), Seam = slope0(m_seam_c, m_seam_e, w),
+                         IVB = slope0(ivb_c, ivb_e, w), HB = slope0(hb_c, hb_e, w)), by = pt]
+est <- ret(cells)
+ids <- unique(cells$pitcher)
+bt  <- rbindlist(lapply(1:200, function(b) ret(cells[data.table(pitcher = sample(ids, length(ids), TRUE)), on = "pitcher", allow.cartesian = TRUE])))
+se  <- bt[, lapply(.SD, sd), by = pt]
+long <- merge(melt(est, id.vars = "pt", value.name = "est"), melt(se, id.vars = "pt", value.name = "se"), by = c("pt", "variable"))
+long[, unreliable := pt %in% c("SL", "FC", "ST")]       # low-efficiency pitches: the measured axis shifts at Coors
+```
+
+```{r retention-plot, fig.width = 9, fig.height = 5, fig.cap = "Share of each movement component kept at Coors (95% bootstrap intervals). Dashed line: drag ratio."}
+pd <- long[variable %in% c("Magnus", "Seam") & pt != "SV" & unreliable == FALSE]
+pd[, pt_lab := factor(PT_NAME[pt], levels = PT_NAME[c("FF", "CU", "SI", "CH", "FS")])]
+ggplot(pd, aes(pt_lab, est, colour = variable)) +
+  geom_hline(yintercept = co$density_from_drag, linetype = 2, colour = "grey60") +
+  geom_pointrange(aes(ymin = est - 1.96 * se, ymax = est + 1.96 * se), position = position_dodge(width = 0.5), size = 0.5) +
+  scale_colour_manual(values = c(Magnus = "#30638e", Seam = "#e07a5f"), name = NULL) +
+  scale_y_continuous(labels = scales::percent, limits = c(0.35, 1)) +
+  labs(x = NULL, y = "Kept at Coors", title = "Seam-driven movement thins out far more than spin-driven movement")
+```
+
+Magnus movement keeps about 80% for every pitch type, in line with the density ratio once the slightly shorter flight is accounted for. Seam-driven movement keeps much less: 55% for splitters, 65% for changeups and 69% for sinkers. The pattern shows up in raw movement without any decomposition: splitters keep essentially all their IVB but lose 3.5 inches of fade.
+
+```{r raw-move}
+raw <- cells[, .(cells = .N, ivb_elsewhere = wm(ivb_e, w), ivb_coors = wm(ivb_c, w), hb_elsewhere = wm(hb_e, w), hb_coors = wm(hb_c, w)), by = pt]
+raw <- merge(raw, est[, .(pt, IVB, HB)], by = "pt")[pt != "SV"][order(-cells)]
+raw[, pt := PT_NAME[pt]]
+kable(raw[, .(`Pitch` = pt, Cells = cells, `IVB elsewhere` = f1(ivb_elsewhere), `IVB Coors` = f1(ivb_coors), `IVB kept` = scales::percent(IVB, 1),
+              `HB elsewhere` = f1(hb_elsewhere), `HB Coors` = f1(hb_coors), `HB kept` = scales::percent(HB, 1))],
+      align = "lrrrrrrr", caption = "Average movement (inches; HB + = arm side) for the same pitches at Coors and elsewhere")
+```
+
+For sliders, cutters, and sweepers, the measured spin axis itself shifts by 1–3° at Coors, which it shouldn't; for low-efficiency pitches Hawk-Eye's axis is probably partly inferred from movement. Their Magnus/seam split is left out above, but their raw movement is reliable: **cutters keep 92% of their cut and lose a quarter of their IVB; sweepers keep 83% of their sweep but drop about 1.9 inches more.**
+
+```{r shape-shift, fig.width = 8, fig.height = 6.5, fig.cap = "Average shape of each pitch type elsewhere (open) and at Coors (filled), same pitchers. Arm-side normalised."}
+mv <- cells[pt != "SV", .(hb_e = wm(hb_e, w), ivb_e = wm(ivb_e, w), hb_c = wm(hb_c, w), ivb_c = wm(ivb_c, w)), by = pt]
+ggplot(mv) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_segment(aes(x = hb_e, y = ivb_e, xend = hb_c, yend = ivb_c, colour = pt), arrow = arrow(length = unit(0.18, "cm")), linewidth = 0.8) +
+  geom_point(aes(hb_e, ivb_e, colour = pt), shape = 21, size = 3.5, stroke = 1.1, fill = "white") +
+  geom_point(aes(hb_c, ivb_c, colour = pt), size = 3) +
+  geom_text(aes(hb_e, ivb_e, label = PT_NAME[pt], colour = pt), vjust = -1.1, size = 3.5, show.legend = FALSE) +
+  scale_colour_manual(values = PT_COL, guide = "none") + coord_equal() +
+  labs(x = "Horizontal break, arm side + (in)", y = "Induced vertical break (in)", title = "Every pitch shrinks toward the origin; seam pitches also rotate")
+```
+
+# 3. What this does to graded pitch quality
+
+## Building a Coors version of every pitch
+
+Each 2025–26 pitch thrown away from Coors was rebuilt as if thrown at Coors: its Magnus and seam components scaled by the retention measured for its pitch type, and its trajectory re-solved from the same release point to the same target with lift and drag thinned.
+
+```{r sim-code, eval = FALSE, class.source = "fold-show"}
+# Same pitch, release point, and target; lift scaled by bT and drag by bD
+coors_sim <- function(vx0, vy0, vz0, ax, ay, az, ext, px, pz, bT, bD) {
+  tp <- t_to(vy0, ay, 50 - YP); yr <- 60.5 - ext; tr <- t_to(vy0, ay, 50 - yr)
+  x50 <- px - vx0 * tp - 0.5 * ax * tp^2;  z50 <- pz - vz0 * tp - 0.5 * az * tp^2
+  xr  <- x50 + vx0 * tr + 0.5 * ax * tr^2; zr  <- z50 + vz0 * tr + 0.5 * az * tr^2; vyr <- vy0 + ay * tr
+  a   <- aero(vx0, vy0, vz0, ax, ay, az, tp)
+  ax2 <- bT * a$tx - bD * a$aD * a$ux; ay2 <- bT * a$ty - bD * a$aD * a$uy; az2 <- bT * a$tz - bD * a$aD * a$uz - GRAV
+  t   <- t_to(vyr, ay2, yr - YP)                                    # re-aim at the same target
+  vx2 <- (px - xr - 0.5 * ax2 * t^2) / t; vz2 <- (pz - zr - 0.5 * az2 * t^2) / t
+  fz  <- vz2 + az2 * t; fy <- vyr + ay2 * t
+  list(flight = t, vaa = -atan(fz / fy) * 180 / pi)
+}
+# Velocity credit: the sea-level release speed with the same flight time as the Coors pitch
+E[, velo_eq := release_speed * flight_sea / flight_coors]
+```
+
+Both versions were applied to a simple pitch grader: a LightGBM model of expected run value, location-neutral, averaged over 1,000 real reference pitches per pitch type and platoon side. The grade is on an intuitive scale where 100 is average, and 10 points in either direction represents one standard deviation.
+
+```{r grade-loss, fig.width = 8.5, fig.height = 5, fig.cap = "Grade change at Coors for every 2025–26 pitcher-season-pitch with 100+ pitches elsewhere."}
+g <- copy(grades)[pt != "SV"]
+g[, change := g_full - g_sea]
+ord <- g[, .(m = wm(change, n)), by = pt][order(m), pt]
+g[, pt_lab := factor(PT_NAME[pt], levels = PT_NAME[ord])]
+ggplot(g, aes(change, pt_lab, fill = pt)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_boxplot(outlier.size = 0.6, outlier.alpha = 0.4, width = 0.6, alpha = 0.85) +
+  scale_fill_manual(values = PT_COL, guide = "none") +
+  labs(x = "Grade change at Coors (10 = 1 SD)", y = NULL, title = "Fastballs lose the most; cutters and sliders gain")
+```
+
+```{r grade-table}
+gt <- grades[, .(Pitches = .N, Sea = wm(g_sea, n), `Coors, movement only` = wm(g_move, n), Coors = wm(g_full, n),
+                 Change = wm(g_full - g_sea, n), `Lose 5+` = wm(as.numeric(g_sea - g_full >= 5), n)), by = pt][order(Change)]
+gt[, pt := PT_NAME[pt]]
+kable(gt[, .(Pitch = pt, Cells = Pitches, Sea = f1(Sea), `Coors, movement only` = f1(`Coors, movement only`), Coors = f1(Coors),
+             Change = f1(Change), `Lose 5+ points` = scales::percent(`Lose 5+`, 1))], align = "lrrrrrr",
+      caption = "Pitch-weighted grades.")
+```
+
+The average pitch loses `r f1(grades[, wm(g_sea - g_full, n)])` grade points: `r f1(grades[, wm(g_sea - g_move, n)])` from movement, with `r f1(grades[, wm(g_full - g_move, n)])` returned by the shorter flight. Four-seamers lose the most, and 60% of them lose five points or more. Cutters and sliders gain: they have little movement to lose and they still get the velocity credit.
+
+## Four-seam flatness: slot survives, ride doesn't
+
+A flat VAA is one of the most valuable fastball traits. It comes from a combination of two data points: release point (lower = flatter), and induced vertical break (more = flatter). Only the latter is an aerodynamic feature.
+
+```{r flatness}
+ff <- grades[pt == "FF"]
+ff[, `:=`(Release = cut(release_pos_z, quantile(release_pos_z, 0:3 / 3), c("Low release", "Mid release", "High release"), include.lowest = TRUE),
+          Ride = cut(ivb, quantile(ivb, 0:3 / 3), c("Low IVB", "Mid IVB", "High IVB"), include.lowest = TRUE))]
+fl <- ff[, .(v = sprintf("%+.2f° → %+.2f° (%s)", wm(vaa_x, n), wm(vaa_x_c, n), f1(wm(g_sea - g_full, n)))), by = .(Release, Ride)]
+kable(dcast(fl, Release ~ Ride, value.var = "v"), align = "lrrr",
+      caption = "Four-seam flatness (approach angle above league average for the location) elsewhere → at Coors, with grade points lost")
+fm <- lm(I(vaa_x_c - vaa_x) ~ ivb + release_pos_z + release_extension + release_speed, data = ff, weights = n)
+```
+
+Each inch of ride costs `r f1(abs(coef(fm)[["ivb"]]), 3)`° of flatness at Coors; each foot of release height costs `r f1(abs(coef(fm)[["release_pos_z"]]), 3)`°. **Flatness from a low slot largely survives Coors; flatness from ride doesn't.** High-ride four-seamers lose 11–12 grade points, low-ride four-seamers lose almost nothing.
+
+# 4. Reality check: what actually happens at Coors
+
+The grader assumes hitters react to a pitch's actual shape. The same paired cells show what really happens to whiffs and contact.
+
+```{r outcomes}
+oc <- cells[, {
+  ws <- 1 / (1 / pmax(swings_c, 1) + 1 / pmax(swings_e, 1)); wt <- 1 / (1 / pmax(takes_c, 1) + 1 / pmax(takes_e, 1))
+  wb <- 1 / (1 / pmax(bips_c, 1) + 1 / pmax(bips_e, 1))
+  .(Cells = .N, `IVB change` = wm(ivb_c - ivb_e, w),
+    `Whiff %` = 100 * wm(whiffs_c / swings_c - whiffs_e / swings_e, ws), `Called strike %` = 100 * wm(cstr_c / takes_c - cstr_e / takes_e, wt),
+    `Ground ball %` = 100 * wm(gbs_c / bips_c - gbs_e / bips_e, wb), `Launch angle` = wm(la_c - la_e, wb))
+}, by = pt][pt != "SV"]
+oc <- merge(oc, grades[, .(`Predicted grade change` = wm(g_full - g_sea, n)), by = pt], by = "pt")[order(`Predicted grade change`)]
+oc[, pt := PT_NAME[pt]]
+kable(oc[, c(list(Pitch = pt, Cells = Cells), lapply(.SD, f1)), .SDcols = c("Predicted grade change", "IVB change", "Whiff %", "Called strike %", "Ground ball %", "Launch angle")],
+      align = "lrrrrrrr", caption = "Coors minus elsewhere, same pitcher-pitch-season (percentage points; launch angle in degrees)")
+```
+
+Two patterns stood out to me immediately:
+
+* **Contact moves in the direction the movement changed.** Four-seamers lose 3 inches of ride and their launch angle drops 3.6° with 4.8 points more ground balls. Curveballs lose 2 inches of depth and their launch angle rises 3.6° with 8.1 points more whiffs. That's exactly what we would expect if hitters were subconciously calibrated to sea-level movement.
+* **The grader overstates the four-seam loss.** Whiffs on four-seamers barely change, and the extra ground balls are especially valuable in a park that punishes fly balls.
+
+Hitters differ between the two sides of each comparison (visiting pitchers face Rockies hitters at Coors), so this is a check on the model rather than a clean test.
+
+# 5. Pitcher archetypes
+
+Arsenal grades are usage-weighted across a pitcher's pitch types (2025–26, 400+ pitches elsewhere).
+
+```{r archetypes}
+pq <- pitch[pitches >= 400]
+arch <- pq[, .(Pitchers = .N, Sea = wm(sea, pitches), Coors = wm(coors, pitches), Loss = wm(loss, pitches)), by = .(fb_family, main_sec)][Pitchers >= 8][order(Loss)]
+kable(arch[, .(`Primary fastball` = fb_family, `Main secondary` = main_sec, Pitchers, Sea = f1(Sea), Coors = f1(Coors), `Grade lost` = f1(Loss))],
+      align = "llrrrr", caption = "Arsenal grade lost at Coors by primary fastball and main secondary pitch")
+```
+
+```{r fb-family, fig.width = 8, fig.height = 4}
+fbf <- pq[fb_family != "no fastball", .(loss = wm(loss, pitches), n = .N), by = fb_family][order(loss)]
+ggplot(fbf, aes(loss, factor(fb_family, levels = fb_family))) +
+  geom_col(aes(fill = loss > 4), width = 0.6) + geom_text(aes(label = f1(loss)), hjust = -0.2) +
+  scale_fill_manual(values = c(`FALSE` = "grey65", `TRUE` = "#d1495b"), guide = "none") + xlim(0, 7) +
+  labs(x = "Arsenal grade points lost at Coors", y = NULL, title = "High-ride four-seamers lose more than twice as much as any other fastball type")
+```
+
+The best-holding combinations pair a sinker or a sub-17-inch four-seamer with a cutter or gyro slider; every arsenal built on a 17+ inch four-seamer loses five points or more. Over-the-top arms lose the most (4.0) and low or sidearm the least (2.5), which as expected.
+
+# 6. Targets
+
+**Comparative advantage.** The market prices pitchers on what they do at sea level. A club that pitches half its innings at Coors should want pitchers whose Coors grade beats what their sea-level grade predicts (the residual from regressing Coors grade on sea-level grade).
+
+```{r targets-plot, fig.width = 9, fig.height = 7}
+tt <- copy(targets)
+fit <- lm(coors ~ sea, data = tt, weights = pitches)
+lab <- rbind(head(tt[rockies == FALSE & sea >= 100][order(-edge)], 10), tt[rockies == TRUE & abs(edge) > 2.5])
+ggplot(tt, aes(sea, coors)) +
+  geom_abline(slope = coef(fit)[2], intercept = coef(fit)[1], colour = "grey50") +
+  geom_point(aes(colour = rockies), alpha = 0.7, size = 2) +
+  geom_text(data = lab, aes(label = sub("^(.*), (.*)$", "\\2 \\1", player_name), colour = rockies), size = 3, vjust = -0.8, check_overlap = TRUE, show.legend = FALSE) +
+  scale_colour_manual(values = c(`FALSE` = "grey55", `TRUE` = ROX), labels = c("Other clubs", "Rockies"), name = NULL) +
+  labs(x = "Arsenal grade elsewhere", y = "Arsenal grade at Coors", title = "2026 arsenals: above the line keeps more at Coors than the market expects")
+```
+
+```{r targets-table}
+top <- head(tt[rockies == FALSE & sea >= 100][order(-edge)], 12)
+kable(top[, .(Pitcher = sub("^(.*), (.*)$", "\\2 \\1", player_name), Team = team, Pitches = pitches, FB = fb_type, Velo = f1(fb_velo),
+              `FB IVB` = f1(fb_ivb), `Arm angle` = f1(arm_angle, 0), `Main secondary` = main_sec,
+              Sea = f1(sea), Coors = f1(coors), Edge = f1(edge))],
+      align = "llrlrrrlrrr", caption = "2026, league-average or better at sea level, ranked by edge (400+ pitches elsewhere)")
+```
+
+The list is dominated by hard throwers with a fastball under 15 inches of ride and a cutter or gyro slider, which is the same profile the physics predicts. Most are relievers on modest samples, so the order should be considered a starting point for scouting rather than a strict ranking.
+
+# Recommendations for the Colorado Rockies
+
+1. **Acquisition:** Velocity, extension and release point are untouched by thin air, while movement obviously is not. Pitchers should be priced at their Coors-specific value, and pitchers with steep VAA fastballs (or flat VAAs where the flatness is coming from low release), and cutters or gyro sliders as their main secondary offerings should be targeted.
+2. **Pitch design:** Cutters and gyro sliders lose the least and gain from the shorter flight. Seam-shifted changeups, splitters and sinkers lose 30–45% of their seam-driven run and fade.
+3. **Home/road usage:** Visiting staffs already lean on cutters (+2.3 points of usage) and away from splitters, changeups and sinkers at Coors; the Rockies' own staff can plan the same shift at home and reverse it on the road.
+4. **Game planning:** Visiting hitters beat the Coors four-seamer into the ground and miss more curveballs, which suggests four-seamers plays better at Coors than its shapes alone imply. Steep VAAs magnify this effect, and should be a focus in both player acquisition and game planning.
+
+# Limitations and next steps
+
+* **Hitter calibration.** The grader can't model hitters who expect sea-level movement. Splitting the outcome check by Rockies vs visiting pitchers, against each batter's own baseline, would separate miscalibration from lineup quality.
+* **Outfield size** is not included in the analysis.
+* **Low-efficiency pitches.** The Magnus/seam split is less reliable for sliders, cutters and sweepers because their measured spin axis shifts at Coors.
+* **Samples.** Visiting pitchers contribute few Coors pitches per season (median about 20 per pitch type); the bootstrap intervals reflect that.
+
+# Reproducibility
+
+Everything uses public Statcast data and runs locally in R (`data.table`, `lightgbm`, `ggplot2`):
+
+| Step | Script | Output |
+|---|---|---|
+| Pull and explore Statcast | `01_statcast_pull_explore.R` | pitch-level data, 2023–2026 |
+| Expected run value, movement model, pitch grader | `02_build_models.R`, `03_regrade.R` | Pitch Shaper grader |
+| Coors analysis | `04_coors_movement.R` | `coors_out/` (read by this report) |
+
+Code: [github.com/charliewiebe/coors-field](https://github.com/charliewiebe/coors-field)
