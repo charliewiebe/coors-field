@@ -1,38 +1,25 @@
-# =====================================================================================
 # 04_coors_movement.R
-# What Coors Field does to pitch movement, whether any way of building a shape holds up better
-# there, and which pitcher types keep their value. Public Statcast only.
-#   1. per-pitch physics from Statcast's 9-parameter fit: drag, lift, flight time, approach angle;
-#      movement split into the part the measured spin axis explains (Magnus) and the rest (seam wake)
-#   2. air density at every park from drag, and whether Coors lift loss is density alone
-#   3. same pitcher, same pitch, same season: Coors against everywhere else
-#   4. which traits change the share of movement kept (spin rate, spin efficiency, seam share, velo, slot)
-#   5. a Coors version of every pitch, graded with the Pitch Shaper grader, checked against actual
-#      whiff and ground-ball changes at Coors
-#   6. pitcher archetypes and the pitchers whose value holds up best at Coors
-# Run after 01-03 from the same folder (needs statcast_data/ and app_artifacts/).
-# Output to paste back: coors_out/coors_report.txt
-# =====================================================================================
+
 RAW_FILE      <- "statcast_data/statcast_raw_2023_2026.rds"
-ART_DIR       <- "app_artifacts"          # grader.txt and app_data.rds from 02/03
+ART_DIR       <- "app_artifacts"
 OUT_DIR       <- "coors_out"
 COORS         <- "COL"
-PT            <- c("FF", "SI", "FC", "SL", "ST", "SV", "CU", "CH", "FS")   # KC/CS folded into CU, as in 02
-MIN_COORS     <- 10          # Coors pitches for a pitcher-season-pitch cell to be paired
-MIN_ELSE      <- 50          # pitches elsewhere for the same cell
-MIN_GRADE     <- 100         # pitches elsewhere for a cell to be graded
-GRADE_SEASONS <- 2025:2026   # seasons graded at sea level and at Coors
+PT            <- c("FF", "SI", "FC", "SL", "ST", "SV", "CU", "CH", "FS"
+MIN_COORS     <- 10
+MIN_ELSE      <- 50
+MIN_GRADE     <- 100
+GRADE_SEASONS <- 2025:2026
 TARGET_SEASON <- 2026
-TARGET_MIN    <- 400         # pitches elsewhere for a pitcher to appear in the target lists
-RELABEL       <- TRUE        # re-label every pitch to the pitcher's own types by velo, spin rate and spin axis (air-independent), Coors and elsewhere alike
-RETENTION     <- "by_type"   # "by_type": Magnus and seam retention per pitch type; "pooled": one factor for every pitch
-VELO_CREDIT   <- TRUE        # credit Coors pitches for the shorter flight time from lower drag
-N_BOOT        <- 200         # bootstrap draws, resampling pitchers
-SENS_CELLS    <- 120         # cells per pitch type for the trait-worth comparison (section 6)
-SENS_K        <- 400         # reference pitches used in section 6 (differences only, so a subsample is enough)
+TARGET_MIN    <- 400
+RELABEL       <- TRUE
+RETENTION     <- "by_type"
+VELO_CREDIT   <- TRUE
+N_BOOT        <- 200
+SENS_CELLS    <- 120
+SENS_K        <- 400
 SEED          <- 42
 THREADS       <- max(1L, parallel::detectCores() - 1L)
-N_PROC        <- if (.Platform$OS.type == "windows") 1L else THREADS   # grader predictions in parallel processes
+N_PROC        <- if (.Platform$OS.type == "windows") 1L else THREADS
 
 pkgs <- c("data.table", "lightgbm", "ggplot2")
 new  <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
@@ -58,9 +45,7 @@ adiff <- function(a, b) ((a - b + 180) %% 360) - 180
 zs    <- function(x) { s <- sd(x, na.rm = TRUE); if (!is.finite(s) || s == 0) x * 0 else (x - mean(x, na.rm = TRUE)) / s }
 slope0 <- function(yc, xe, w) { ok <- is.finite(yc) & is.finite(xe) & is.finite(w); sum(w[ok] * xe[ok] * yc[ok]) / sum(w[ok] * xe[ok]^2) }
 
-# =====================================================================================
-# LOAD
-# =====================================================================================
+# load
 REQ <- c("game_type", "game_pk", "game_date", "game_year", "pitcher", "p_throws", "pitch_type", "release_speed", "release_spin_rate",
          "spin_axis", "release_extension", "release_pos_x", "release_pos_z", "pfx_x", "pfx_z", "plate_x", "plate_z",
          "vx0", "vy0", "vz0", "ax", "ay", "az", "home_team", "description")
@@ -85,11 +70,7 @@ sc[, coors := home_team == COORS]
 if (all(is.na(sc$player_name))) sc[, player_name := as.character(pitcher)]
 sc[, rid := .I]
 
-# =====================================================================================
-# PER-PITCH PHYSICS
-# Statcast fits each pitch with constant acceleration from y = 50 ft. Aerodynamic acceleration
-# (everything but gravity) splits into drag, along -v, and lift, across v. Both scale with air density.
-# =====================================================================================
+# per-pitch physics
 GRAV <- 32.174; YP <- 17 / 12; K_SEA <- 5.383e-3
 aero <- function(vx0, vy0, vz0, ax, ay, az, tp) {
   bx <- vx0 + ax * tp / 2; by <- vy0 + ay * tp / 2; bz <- vz0 + az * tp / 2; vb <- sqrt(bx^2 + by^2 + bz^2)
@@ -138,7 +119,6 @@ sc[, `:=`(swing = description %in% SWING, whiff = description %in% c("swinging_s
 sc[, gb := bip & bb_type %in% "ground_ball"]
 sc[bip == FALSE, launch_angle := NA_real_]
 
-# pitcher's team; Rockies = the pitcher's main team that season
 has_team <- !all(is.na(sc$inning_topbot)) && !all(is.na(sc$away_team))
 sc[, p_team := if (has_team) fifelse(inning_topbot == "Top", home_team, away_team) else NA_character_]
 PS <- sc[, .(pitches = .N, coors_share = mean(coors),
@@ -146,10 +126,7 @@ PS <- sc[, .(pitches = .N, coors_share = mean(coors),
 PS[, rockies := fifelse(is.na(team), coors_share >= 0.35, team == COORS)]
 NAMES <- sc[, .(player_name = player_name[.N], p_throws = p_throws[.N]), by = pitcher]
 
-# =====================================================================================
-# RELABEL (Savant's classifier leans on movement, which Coors changes). Every pitch, at Coors or not, goes to the
-# pitcher's own type whose velo, spin rate and spin axis it sits clearly closest to, so both sides are labelled alike.
-# =====================================================================================
+# pitch classification
 relab <- data.table(); relab_rate <- c(coors = 0, else_ = 0)
 if (RELABEL) {
   okr <- sc[, is.finite(release_spin_rate) & is.finite(spin_axis)]
@@ -174,17 +151,13 @@ if (RELABEL) {
   rm(best_d, best_pt, own_d, d2, j, mv, okr, cen); gc()
 }
 
-# =====================================================================================
-# AIR BY GAME: drag and lift relative to the same pitcher-pitch-season away from Coors
-# =====================================================================================
+# drag and lift relative to the same pitcher-pitch-season away from Coors
 base <- sc[coors == FALSE, .(nE = .N, kD0 = median(kD, na.rm = TRUE), kT0 = median(kT, na.rm = TRUE)), by = .(pitcher, game_year, pt)][nE >= 20]
 sc[base, on = .(pitcher, game_year, pt), `:=`(rD = kD / i.kD0, rT = kT / i.kT0)]
 GM <- sc[is.finite(rD) & is.finite(rT) & rD > 0 & rT > 0,
          .(n = .N, D = median(rD), L = median(rT), park = home_team[1], game_year = game_year[1], month = month(game_date[1])), by = game_pk][n >= 50]
 
-# =====================================================================================
-# PAIRED CELLS: same pitcher, pitch type and season, at Coors and elsewhere
-# =====================================================================================
+# same pitcher, pitch type, and season, at Coors and elsewhere
 cell_stats <- function(d) d[, .(
   n = .N, velo = mean(release_speed), vplate = mean(vplate, na.rm = TRUE), flight = mean(flight, na.rm = TRUE),
   spin = mean(release_spin_rate, na.rm = TRUE), axis = circ_mean(axis_m), ivb = mean(ivb), hb = mean(hb_arm), mov = mean(mov),
@@ -200,7 +173,7 @@ if (nrow(C) < 30) stop("Only ", nrow(C), " pitcher-season-pitch cells have ", MI
 C[PS, on = .(pitcher, game_year), `:=`(rockies = i.rockies, team = i.team)]
 C[NAMES, on = "pitcher", `:=`(player_name = i.player_name, p_throws = i.p_throws)]
 C[is.na(rockies), rockies := FALSE]
-C[, w  := 1 / (1 / n_c + 1 / n_e)]                                                  # effective pitches
+C[, w  := 1 / (1 / n_c + 1 / n_e)]                           
 C[, `:=`(lT = log(kT_c / kT_e), lD = log(kD_c / kD_e))]
 C[, `:=`(wT = 1 / (kT_sd_c^2 / (n_c * kT_c^2) + kT_sd_e^2 / (n_e * kT_e^2)),        # inverse variance of the log ratios
          wD = 1 / (kD_sd_c^2 / (n_c * kD_c^2) + kD_sd_e^2 / (n_e * kD_e^2)))]
@@ -250,9 +223,7 @@ if (RETENTION == "by_type") {
 } else RT[, `:=`(bM = pool$magnus, bS = pool$magnus, bT = pool$lift, bD = pool$drag)]
 RT[!is.finite(bM), bM := pool$magnus][!is.finite(bS), bS := pool$seam][!is.finite(bT), bT := pool$lift][!is.finite(bD), bD := pool$drag]
 
-# =====================================================================================
-# REPORT 0-4: environment and movement
-# =====================================================================================
+# environment and movement
 hdr("0. RUN INFO")
 say("Run: ", format(Sys.time(), "%Y-%m-%d %H:%M"), " | ", R.version.string, " | data.table ", as.character(packageVersion("data.table")),
     " | lightgbm ", as.character(packageVersion("lightgbm")))
@@ -336,9 +307,7 @@ if (nrow(H) >= 60) {
   shw(ht[, .(trait = term, pct_per_sd, ci_lo, ci_hi)], 2)
 } else say("Too few cells (", nrow(H), ") for the trait model.")
 
-# =====================================================================================
-# 5. VALUE AT COORS: Pitch Shaper grader on sea-level and Coors versions of every pitch
-# =====================================================================================
+# Pitch Shaper grader on sea-level and Coors versions of every pitch
 tick("building Coors versions of ", GRADE_SEASONS[1], "-", max(GRADE_SEASONS), " pitches")
 E <- sc[coors == FALSE & game_year %in% GRADE_SEASONS]
 E[RT, on = "pt", `:=`(bM = i.bM, bS = i.bS, bT = i.bT, bD = i.bD)]
@@ -370,7 +339,7 @@ GC[, is_lhp := as.numeric(p_throws == "L")]
 
 A  <- readRDS(file.path(ART_DIR, "app_data.rds")); GB <- lgb.load(file.path(ART_DIR, "grader.txt"))
 GF <- A$grader_feats; STUFF <- A$stuff; BM <- A$bat_means
-grade_block <- function(shapes, pool, same_hand) {                   # 03_regrade.R logic, chunks run in parallel processes
+grade_block <- function(shapes, pool, same_hand) {
   K <- nrow(pool$ctx); chunk <- max(1L, min(floor(150000 / K), ceiling(nrow(shapes) / N_PROC)))
   chunks <- split(seq_len(nrow(shapes)), ceiling(seq_len(nrow(shapes)) / chunk))
   one <- function(ix) {
@@ -391,10 +360,10 @@ grade_block <- function(shapes, pool, same_hand) {                   # 03_regrad
   }
   res <- if (N_PROC > 1L && length(chunks) > 1L) parallel::mclapply(chunks, one, mc.cores = N_PROC) else lapply(chunks, one)
   bad <- vapply(res, function(r) inherits(r, "try-error") || is.null(r), logical(1))
-  if (any(bad)) res[bad] <- lapply(chunks[bad], one)            # retry any failed worker in the main process
+  if (any(bad)) res[bad] <- lapply(chunks[bad], one)
   unlist(res, use.names = FALSE)
 }
-grade_xrv <- function(S, pools = A$pool) {   # runs/100, straight average of the two batter sides, as the app shows
+grade_xrv <- function(S, pools = A$pool) {
   out <- matrix(NA_real_, nrow(S), 2)
   for (h in 0:1) for (p in unique(S$pt)) {
     i <- which(S$pt == p); kk <- paste(p, h); if (is.null(pools[[kk]])) next
@@ -409,7 +378,7 @@ shape <- function(version, d = GC) {
   if (version == "full") s[, `:=`(release_speed = d$velo_eq, fb_velo = d$fb_velo_eq)]
   s
 }
-CKPT <- file.path(OUT_DIR, "graded_cells.rds")         # reused on a rerun if every shape is unchanged
+CKPT <- file.path(OUT_DIR, "graded_cells.rds")
 ck <- if (file.exists(CKPT)) tryCatch(readRDS(CKPT), error = function(e) NULL) else NULL
 same <- !is.null(ck) && nrow(ck) == nrow(GC) && isTRUE(VELO_CREDIT == attr(ck, "velo_credit")) &&
   all(ck$pitcher == GC$pitcher & ck$game_year == GC$game_year & ck$pt == GC$pt) &&
@@ -505,9 +474,7 @@ if (nrow(cl) >= 30)
   say("Cell level (", nrow(cl), " graded cells): r(predicted loss, whiff change) = ",
       round(cl[, wcor(loss, whiffs_c / pmax(swings_c, 1) - whiffs_e / pmax(swings_e, 1), 1 / (1 / pmax(swings_c, 1) + 1 / pmax(swings_e, 1)))], 3))
 
-# =====================================================================================
-# 8-9. PITCHERS: archetypes and targets
-# =====================================================================================
+# pitcher archetypes and targets
 GC[, use := n / sum(n), by = .(pitcher, game_year)]
 GRP <- c(FF = "second fastball", SI = "second fastball", FC = "cutter/gyro slider", SL = "cutter/gyro slider", ST = "sweeper/curve", SV = "sweeper/curve",
          CU = "sweeper/curve", CH = "changeup/splitter", FS = "changeup/splitter")
@@ -570,9 +537,7 @@ shw(dcast(U[, .(d_share = 100 * wm(n_c / tot_c - n_e / tot_e, tot_c)), by = .(pt
           pt ~ group, value.var = "d_share"), 2)
 emit("Percentage-point change in usage at Coors (pitch-type labels after re-labelling).")
 
-# =====================================================================================
-# FILES AND PLOTS
-# =====================================================================================
+# visualization
 fwrite(pk, file.path(OUT_DIR, "parks.csv"))
 fwrite(C, file.path(OUT_DIR, "cells_paired.csv"))
 fwrite(GC[, .(pitcher, player_name, game_year, pt, p_throws, n, release_speed, hb_arm, ivb, hb_c, ivb_c, velo_eq, spin, eff, seam_share,
